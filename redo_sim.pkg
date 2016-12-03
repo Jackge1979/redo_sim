@@ -1,0 +1,371 @@
+set serveroutput on;
+
+DECLARE
+	object_exists NUMBER;
+BEGIN
+	SELECT count(*) INTO object_exists FROM all_tables WHERE owner = 'ADMIN' AND table_name = 'REDO_SIM_OUTPUT';
+	IF (object_exists = 0) THEN
+		EXECUTE IMMEDIATE 'CREATE TABLE admin.redo_sim_output (sim_number NUMBER, sid NUMBER, role VARCHAR2(14), event_time DATE, message VARCHAR2(4000))';
+	END IF;
+
+	SELECT count(*) INTO object_exists FROM all_tables WHERE owner = 'ADMIN' AND table_name = 'REDO_SIM_STORAGE';
+	IF (object_exists = 0) THEN
+		EXECUTE IMMEDIATE 'CREATE TABLE admin.redo_sim_storage (pk NUMBER NOT NULL, data VARCHAR2(512), CONSTRAINT pk_redo_sim_storage PRIMARY KEY (pk) USING INDEX (CREATE UNIQUE INDEX admin.pk_redo_sim_storage ON admin.redo_sim_storage (pk)))';
+	END IF;
+
+	SELECT count(*) INTO object_exists FROM all_sequences WHERE sequence_owner = 'ADMIN' and sequence_name = 'REDO_SIM_SEQUENCE';
+	IF (object_exists = 0) THEN
+		EXECUTE IMMEDIATE 'CREATE SEQUENCE admin.redo_sim_sequence';
+	END IF;
+END;
+/
+
+CREATE OR REPLACE PACKAGE admin.redo_sim AUTHID CURRENT_USER AS
+
+	TYPE inst_ids IS TABLE OF gv$instance.inst_id%type;
+
+	PROCEDURE configure (
+	tablespace IN varchar2 DEFAULT 'scratch',
+	bytes IN number DEFAULT 128*1024*1024);
+	
+	PROCEDURE simulate (
+	seconds IN number,
+	bytes_ps IN number,
+	commits_ps IN number,
+	verbose IN number DEFAULT 1);
+
+	PROCEDURE sim_worker (
+	sim_number IN number,
+	worker_num IN number,
+	seconds IN number,
+	bytes_ps IN number,
+	commits_ps IN number,
+	low_row IN number,
+	high_row IN number,
+	update_string IN varchar2,
+	verbose IN number);
+
+	PROCEDURE log_output (
+	sim_number IN number,
+	role IN varchar2,
+	event_time IN date,
+	message IN varchar2,
+	verbose IN number);
+
+        -- Helper procedure, wraps DBMS_OUTPUT to handle output
+        -- strings longer than 255 characters.
+        PROCEDURE safe_output (
+        input IN varchar2);
+
+        FUNCTION fork (
+        procname IN varchar2,
+        instance IN number DEFAULT 1)
+        RETURN BINARY_INTEGER;
+
+END redo_sim;
+/
+
+CREATE OR REPLACE PACKAGE BODY admin.redo_sim AS
+
+PROCEDURE configure (
+	tablespace IN varchar2 DEFAULT 'scratch',
+	bytes IN number DEFAULT 128*1024*1024)
+IS
+	sql_text varchar2(32767);
+	object_exists NUMBER := 0;
+	i NUMBER;
+BEGIN
+	SELECT count(*) INTO object_exists FROM all_tables WHERE owner = 'ADMIN' AND table_name = 'REDO_SIM_OUTPUT';
+	IF (object_exists = 0) THEN
+		sql_text := 'CREATE TABLE admin.redo_sim_output (sim_number NUMBER, sid NUMBER, role VARCHAR2(14), event_time DATE, message VARCHAR2(4000)) TABLESPACE '||tablespace;
+		EXECUTE IMMEDIATE sql_text;
+		log_output(-1, 'Configuration',sysdate,'Executed: '||sql_text,1);
+	END IF;
+
+	SELECT count(*) INTO object_exists FROM all_tables WHERE owner = 'ADMIN' AND table_name = 'REDO_SIM_STORAGE';
+	IF (object_exists = 1) THEN
+		sql_text := 'DROP TABLE admin.redo_sim_storage';
+		log_output(-1, 'Configuration',sysdate,'Executing: '||sql_text,1);
+		EXECUTE IMMEDIATE sql_text;
+	END IF;
+	sql_text := 'CREATE TABLE admin.redo_sim_storage (pk NUMBER NOT NULL, data VARCHAR2(512), CONSTRAINT pk_redo_sim_storage PRIMARY KEY (pk) USING INDEX (CREATE UNIQUE INDEX admin.pk_redo_sim_storage ON admin.redo_sim_storage (pk) TABLESPACE '||tablespace||')) TABLESPACE '||tablespace||' INITRANS 16 STORAGE (INITIAL '||trunc(1.2*bytes/1024)||' K)';
+	log_output(-1, 'Configuration',sysdate,'Executing: '||sql_text,1);
+	EXECUTE IMMEDIATE sql_text;
+
+	log_output(-1, 'Configuration',sysdate,'Inserting rows into admin.redo_sim_storage.',1);
+	FOR i IN 0 .. floor(bytes/520) LOOP
+		INSERT INTO admin.redo_sim_storage values (i,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+	END LOOP;
+	COMMIT;
+
+	SELECT count(*) INTO object_exists FROM all_sequences WHERE sequence_owner = 'ADMIN' and sequence_name = 'REDO_SIM_SEQUENCE';
+	IF (object_exists = 0) THEN
+		sql_text := 'CREATE SEQUENCE admin.redo_sim_sequence';
+		log_output(-1,'Configuration',sysdate,'Executing: '||sql_text,1);
+		EXECUTE IMMEDIATE sql_text;
+	END IF;
+
+	log_output(-1, 'Configuration',sysdate,'Configuration complete',1);
+
+END configure;
+
+PROCEDURE simulate (
+	seconds IN number,
+	bytes_ps IN number,
+	commits_ps IN number,
+	verbose IN number DEFAULT 1)
+IS
+	workers NUMBER := 0;
+	sim_number NUMBER;
+	fork_job_id NUMBER;
+	sql_text VARCHAR2(32767);
+	worker_bps NUMBER;
+	worker_cps NUMBER;
+	data_rows NUMBER;
+	low_row NUMBER;
+	high_row NUMBER;
+	my_commits_ps NUMBER;
+	my_worker_bps NUMBER;
+	my_worker_cps NUMBER;
+	bytes_per_commit NUMBER;
+	update_string VARCHAR2(512);
+	current_storage_length NUMBER;
+	instances INST_IDS;
+	CURSOR get_instance_ids IS
+	SELECT inst_id 
+	FROM gv$instance
+	ORDER BY inst_id;
+	worker_inst_id NUMBER;
+BEGIN
+	SELECT admin.redo_sim_sequence.nextval INTO sim_number FROM DUAL;
+
+	IF (commits_ps > bytes_ps) THEN
+		log_output(sim_number, 'Sim Master',sysdate,'ERROR: Commits per second must be less than or equal to bytes per second.',verbose);
+		my_commits_ps := bytes_ps;
+	ELSE 
+		my_commits_ps := commits_ps;
+	END IF;
+
+	-- Configure storage table if necessary.
+	bytes_per_commit := floor(bytes_ps/my_commits_ps);
+	IF (bytes_per_commit >= 1024) THEN
+		update_string := 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+	ELSE
+		FOR i IN 1 .. floor(bytes_per_commit/2) LOOP
+			update_string := 'a'||update_string;
+		END LOOP;
+	END IF;
+	SELECT length(data) INTO current_storage_length FROM admin.redo_sim_storage WHERE pk = 0;
+	IF (current_storage_length != length(update_string)) THEN
+		log_output(sim_number, 'Sim Master', sysdate, 'Populating storage table rows.', verbose);
+		UPDATE admin.redo_sim_storage SET data = update_string;
+		COMMIT;
+	END IF;
+
+	
+	-- We presume ach worker can handle up to 1M/second of redo, and up to 100 commits/second.
+	IF (floor(bytes_ps/1024/1024) > floor(my_commits_ps/100)) THEN
+		workers := floor(bytes_ps/1024/1024);
+	ELSE
+		workers := floor(my_commits_ps/100);
+	END IF;
+	IF (workers = 0) THEN
+		workers := 1;
+	END IF;
+	log_output(sim_number, 'Sim Master',sysdate,'Starting '||workers||' workers to produce '||bytes_ps||' bytes per second of redo with '||my_commits_ps||' commits per second.',verbose);
+
+	worker_bps := floor(bytes_ps/workers);
+	worker_cps := floor(my_commits_ps/workers);
+	IF (worker_bps = 0) THEN
+		worker_bps := 1;
+	END IF;
+	IF (worker_cps = 0) THEN
+		worker_cps := 1;
+	END IF;
+
+	SELECT count(*) INTO data_rows FROM admin.redo_sim_storage;
+
+	OPEN get_instance_ids;
+        FETCH get_instance_ids BULK COLLECT INTO instances LIMIT 1024;
+
+	FOR i IN 1 .. workers LOOP
+		IF (worker_bps != floor(bytes_ps/workers) AND mod(i,2) = 0) THEN
+			--Even numbered worker, account for the fact
+			--that we take the floor when dividing work by
+			--worker.
+			my_worker_bps := worker_bps+1;
+			my_worker_cps := worker_cps+1;
+		ELSE
+			my_worker_bps := worker_bps;
+			my_worker_cps := worker_cps;
+		END IF;
+		low_row := floor(data_rows/workers)*(i-1);
+		high_row := low_row + floor(data_rows/workers)-1;
+		sql_text := 'admin.redo_sim.sim_worker('|| sim_number || ',' ||i|| ',' ||seconds|| ','|| my_worker_bps || ','|| my_worker_cps || ','|| low_row|| ','|| high_row|| ','''|| update_string|| ''','|| verbose ||');';
+		--Round robin our workers between any available instances.
+		IF (mod(i,instances.count) = 0) THEN
+			worker_inst_id := instances(instances.count);
+		ELSE
+			worker_inst_id := instances(mod(i,instances.count));
+		END IF;
+		--The decode nonsense is so that we go through the
+		--instances on order from the first one up, and the fact
+		--that PL/SQL uses 1 based arrays.
+		fork_job_id := fork(sql_text, worker_inst_id);
+		log_output(sim_number, 'Sim Master',sysdate,'Starting worker '||i||' with job id '||fork_job_id||' on instance 1.',verbose);
+        END LOOP;
+
+END simulate;
+
+PROCEDURE sim_worker (
+	sim_number IN number,
+	worker_num IN number,
+	seconds IN number,
+	bytes_ps IN number,
+	commits_ps IN number,
+	low_row IN number,
+	high_row IN number,
+	update_string IN varchar2,
+	verbose IN number)
+IS
+	bytes_per_commit NUMBER;
+	rows_per_commit NUMBER := 1;
+	i NUMBER;
+	j NUMBER;
+	current_row NUMBER;
+	worker_start_t NUMBER;
+	worker_end_t NUMBER;
+	start_t NUMBER;
+	second NUMBER;
+	redo_start NUMBER;
+	redo_end NUMBER;
+	commits_start NUMBER;
+	commits_end NUMBER;
+	redo_total NUMBER;
+	commits_total NUMBER;
+	redo_average NUMBER;
+	commits_average NUMBER;
+        sleep_time NUMBER;
+BEGIN
+	bytes_per_commit := floor(bytes_ps/commits_ps);
+	IF (bytes_per_commit >= 1024) THEN
+		rows_per_commit := floor(bytes_per_commit/1024);
+	END IF;
+
+	current_row := low_row;
+	
+	log_output(sim_number, 'Sim Worker '||worker_num, sysdate, 'Starting redo generation.',verbose);
+
+	SELECT value INTO commits_start
+	FROM v$sesstat s, v$statname n
+	WHERE sid = SYS_CONTEXT( 'USERENV', 'SID' )
+	AND s.statistic# = n.statistic#
+	AND name = 'user commits';
+
+	SELECT value INTO redo_start
+	FROM v$sesstat s, v$statname n
+	WHERE sid = SYS_CONTEXT( 'USERENV', 'SID' )
+	AND s.statistic# = n.statistic#
+	AND name = 'redo size';
+
+	worker_start_t := dbms_utility.get_time;
+
+	FOR second IN 1 .. seconds LOOP
+		start_t := dbms_utility.get_time;
+		FOR i IN 1 .. commits_ps LOOP
+			FOR j IN 1 .. rows_per_commit LOOP
+				UPDATE admin.redo_sim_storage SET data = update_string WHERE pk = current_row;
+				IF (current_row < high_row) THEN
+					current_row := current_row +1;
+				ELSE 
+					current_row := low_row;
+				END IF;
+                                sleep_time := ((i-1)*rows_per_commit+j)/(commits_ps*rows_per_commit) - (dbms_utility.get_time - start_t)/100;
+                                IF ( sleep_time > 0 ) THEN
+       				    dbms_lock.sleep(sleep_time);
+                                END IF;
+			END LOOP;
+                        sleep_time := i/commits_ps - (dbms_utility.get_time - start_t)/100;
+                        IF ( sleep_time > 0 ) THEN
+   			    dbms_lock.sleep(sleep_time);
+                        END IF;
+			COMMIT;
+		END LOOP;			
+	END LOOP;	
+
+	worker_end_t := dbms_utility.get_time;
+
+	SELECT value INTO redo_end
+	FROM v$sesstat s, v$statname n
+	WHERE sid = SYS_CONTEXT( 'USERENV', 'SID' )
+	AND s.statistic# = n.statistic#
+	AND name = 'redo size';
+
+	SELECT value INTO commits_end
+	FROM v$sesstat s, v$statname n
+	WHERE sid = SYS_CONTEXT( 'USERENV', 'SID' )
+	AND s.statistic# = n.statistic#
+	AND name = 'user commits';
+
+	redo_total := redo_end - redo_start;
+	commits_total := commits_end - commits_start;
+	
+	redo_average := redo_total / (1024*(worker_end_t - worker_start_t)/100);
+	commits_average := commits_total / ((worker_end_t - worker_start_t)/100);
+
+	log_output(sim_number, 'Sim Worker'||worker_num,sysdate, 'Completed simulation, generated '||redo_total||' bytes of redo and committed '||commits_total||' times.  Averaged '||substr(redo_average,1,7)||' Kb of redo per second, with '||substr(commits_average,1,5)||' commits per second.', verbose);
+
+END sim_worker;
+
+-- Produce screen and tabular output.
+PROCEDURE log_output (
+	sim_number IN number,
+	role IN varchar2,
+	event_time IN date,
+	message IN varchar2,
+	verbose IN number)
+AS
+	PRAGMA AUTONOMOUS_TRANSACTION;
+BEGIN
+	INSERT INTO admin.redo_sim_output values (sim_number, SYS_CONTEXT( 'USERENV', 'SID' ), role, event_time, message);
+	COMMIT;
+	IF (verbose = 1) THEN
+		safe_output(message);
+	END IF;
+END log_output;
+
+
+-- Work around dbms_outputs stupidity.
+PROCEDURE safe_output (
+        input IN varchar2)
+IS
+        i number;
+        lines number;
+BEGIN
+        lines := floor(length(input)/255);
+        FOR i IN 0 .. lines LOOP
+                dbms_output.put_line(substr(input,i*255+1,255));
+        END LOOP;
+END safe_output;
+
+-- A non blocking way to spin off a child process running procname.
+-- Adds one job queue process to be run immediately, one time only.
+FUNCTION fork (
+        procname IN varchar2,
+        instance IN number DEFAULT 1)
+RETURN BINARY_INTEGER
+AS
+        PRAGMA AUTONOMOUS_TRANSACTION;
+        job_number number;
+BEGIN
+        dbms_job.submit( job_number, procname, sysdate, null, false , instance);
+        commit;
+        RETURN job_number;
+END fork;
+
+END redo_sim;
+/
+
+--exec redo_sim.simulate(60,16*1024,4);
+
+--select * from admin.redo_sim_output where sim_number = 33 order by event_time;
